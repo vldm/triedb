@@ -88,6 +88,15 @@ impl<'a> MerkleNode<'a> {
         })
     }
 
+    // Return data, if current node can have it
+    pub fn data(&self) -> Option<&[u8]> {
+        match *self {
+            Self::Branch(Branch { data, .. }) => data,
+            Self::Leaf(Leaf { data, .. }) => Some(data),
+            Self::Extension(..) => None,
+        }
+    }
+
     /// Whether the node can be inlined to a merkle value.
     pub fn inlinable(&self) -> bool {
         rlp::encode(self).to_vec().len() < 32
@@ -127,11 +136,29 @@ impl<'a> Encodable for MerkleNode<'a> {
 
 /// Represents a merkle value.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MerkleValue<'a> {
+pub enum MerkleValue<'a, T=MerkleNode<'a>> { // | on extension (H256 -> Branch<'a> | Branch<'a>)
     Empty,
     Full(Box<MerkleNode<'a>>),
     Hash(H256),
 }
+
+struct Link<T> {
+    hash: H256,
+    data: RefCell<Option<T>>
+}
+
+impl Link<T: rlp::Decodable> {
+    fn deserialize(db: &impl Database) -> Result<T, Error> {todo!()}
+    fn deref(&self, db: &impl Database) -> &T {
+        se
+    }
+}
+
+enum MerkleValue2<'a, T=MerkleNode<'a>> {
+    Full(Box<T>),
+    Hash(Link<T>),
+}
+
 
 impl<'a> MerkleValue<'a> {
     /// Given a RLP, decode it to a merkle value.

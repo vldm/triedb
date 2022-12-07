@@ -1,4 +1,5 @@
 use std::borrow::Borrow;
+use std::convert::TryFrom;
 use std::ops::{Deref, DerefMut};
 use std::sync::RwLock;
 
@@ -9,11 +10,6 @@ use crate::walker::inspector::TrieInspector;
 use crate::Database;
 use primitive_types::H256;
 use rlp::Rlp;
-
-pub mod verify;
-
-#[cfg(test)]
-mod tests;
 
 #[cfg(feature = "tracing-enable")]
 use tracing::instrument;
@@ -33,6 +29,24 @@ struct DataNode {
     data: Vec<u8>,
 }
 
+impl<'a> From<KeyedMerkleNode<'a>> for Option<DataNode> {
+    fn from(rhs: KeyedMerkleNode<'a>) -> Self {
+        match rhs {
+            KeyedMerkleNode::FullEncoded(hash, _d) => {
+                let merkle_node = rhs.merkle_node();
+                merkle_node.data().map(|data| DataNode {
+                    hash,
+                    // TODO: allocation
+                    data: data.to_vec(),
+                })
+            }
+            KeyedMerkleNode::Partial(_) => {
+                unimplemented!()
+            }
+        }
+    }
+}
+
 ///
 /// Represent data diff between data node.
 /// Need for child tries processing.
@@ -41,6 +55,16 @@ struct DataNode {
 struct DataNodeChange {
     left: Option<DataNode>,
     right: Option<DataNode>,
+}
+
+impl DataNodeChange {
+    fn reverse(self) -> Self {
+        // Replace left and right
+        Self {
+            left: self.right,
+            right: self.left,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -65,12 +89,7 @@ impl Changes {
         let data_diff = self
             .data_diff
             .into_iter()
-            .map(|changed|
-            // Replace left and right
-            DataNodeChange {
-                left: changed.right,
-                right: changed.left,
-            })
+            .map(DataNodeChange::reverse)
             .collect();
         Self { changes, data_diff }
     }
@@ -95,10 +114,31 @@ impl Changes {
             log::trace!("Skipping to insert inline node")
         }
     }
+
+    fn register_data_change<'a>(
+        &mut self,
+        left_entry: Option<&KeyedMerkleNode>,
+        right_entry: Option<&KeyedMerkleNode>,
+    ) {
+        self.data_diff.push(DataNodeChange {
+            left: left_entry.and_then(|e| {
+                e.merkle_node().data().map(|data| DataNode {
+                    hash: e.db_node_key(),
+                    data: data.to_vec(),
+                })
+            }),
+            right: right_entry.and_then(|e| {
+                e.merkle_node().data().map(|data| DataNode {
+                    hash: e.db_node_key(),
+                    data: data.to_vec(),
+                })
+            }),
+        })
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct DiffFinder<DB, F> {
+pub struct DiffFinder<DB, F> {
     pub db: DB,
     child_extractor: F,
 }
@@ -215,6 +255,12 @@ impl<'a> KeyedMerkleNode<'a> {
             }
         }
     }
+    fn db_node_key(&self) -> H256 {
+        match self {
+            Self::Partial(..) => unimplemented!(),
+            Self::FullEncoded(h, ..) => *h,
+        }
+    }
 }
 
 impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sync>
@@ -233,13 +279,8 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
         start_state_root: H256,
         end_state_root: H256,
     ) -> Result<Vec<Change>, ()> {
-        self.compare_roots(
-            Default::default(),
-            Default::default(),
-            start_state_root,
-            end_state_root,
-        )
-        .map(|c| c.changes)
+        self.compare_roots(start_state_root, end_state_root)
+            .map(|c| c.changes)
     }
 
     fn fetch_node(&self, hash: H256) -> KeyedMerkleNode<'_> {
@@ -247,13 +288,7 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
 
         KeyedMerkleNode::FullEncoded(hash, bytes)
     }
-    fn compare_roots(
-        &self,
-        left_key: NibbleVec,
-        right_key: NibbleVec,
-        left_root: H256,
-        righ_root: H256,
-    ) -> Result<Changes, ()> {
+    fn compare_roots(&self, left_root: H256, righ_root: H256) -> Result<Changes, ()> {
         Ok(
             match (
                 left_root == crate::empty_trie_hash(),
@@ -267,8 +302,8 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
                     let right_node = self.fetch_node(righ_root);
 
                     self.compare_nodes(
-                        Entry::new(left_key, left_node),
-                        Entry::new(right_key, right_node),
+                        Entry::new(Default::default(), left_node),
+                        Entry::new(Default::default(), right_node),
                     )
                 }
             },
@@ -289,7 +324,7 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
             return changes;
         }
 
-        let branch_level = Self::check_branch_level(&left_entry.nibble, &right_entry.nibble);
+        let branch_level = Self::compare_node_levels(&left_entry, &right_entry);
         match branch_level {
             // We found two completely different paths
             ComparePathResult::Uncomparable => {
@@ -311,6 +346,7 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
         };
         self.compare_body(branch_level, left_entry, right_entry, changes)
     }
+
     fn compare_body(
         &self,
         branch_level: ComparePathResult,
@@ -318,6 +354,40 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
         right_entry: Entry<KeyedMerkleNode>,
         mut changes: Changes,
     ) -> Changes {
+
+        if branch_level == ComparePathResult::SamePath {
+            match (
+            left_entry.value.merkle_node(),
+            right_entry.value.merkle_node(),
+            )
+            {
+                (
+                    MerkleNode::Leaf(Leaf {
+                    nibbles: lkey,
+                    data: ldata,
+                }),
+                MerkleNode::Leaf(Leaf {
+                    nibbles: rkey,
+                    data: rdata,
+                }),) => {
+                    assert_ne!(ldata, rdata);
+                    // data changed
+                }
+                (MerkleNode::Leaf(Leaf {
+                    nibbles: lkey,
+                    data: ldata,
+                }),
+                    MerkleNode::Extension(extension)
+                ),
+                ) => {
+                    if extension.v.is_branch() {
+                        compare_data(leaf, branch)
+                    }
+                }
+                _ => {todo!()}
+            }
+        }
+
         match (
             left_entry.value.merkle_node(),
             right_entry.value.merkle_node(),
@@ -333,15 +403,26 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
                     data: rdata,
                 }),
             ) => {
+                // two different accounts, or one account with changed data
                 if lkey != rkey || ldata != rdata {
-                    assert_eq!(
-                        left_entry.nibble.len() + lkey.len(),
-                        right_entry.nibble.len() + rkey.len(),
-                        "Diff work only with fixed sized key"
-                    );
+                    // assert_eq!(
+                    //     left_entry.nibble.len() + lkey.len(),
+                    //     right_entry.nibble.len() + rkey.len(),
+                    //     "Diff work only with fixed sized key"
+                    // );
+                    if lkey == rkey {
+                        changes
+                            .register_data_change(Some(&left_entry.value), Some(&right_entry.value))
+                    } else {
+                        // if key differ - this is two different accounts, and no reasons to compare their data.
+                        changes.register_data_change(None, Some(&right_entry.value));
+                        changes.register_data_change(Some(&left_entry.value), None);
+                    }
+
                     // if node is not same then it replace of new node
+                    // TODO: Why deep_remove/insert ?
                     changes.extend(&self.deep_remove(left_entry.value));
-                    changes.extend(&self.deep_insert(right_entry.value))
+                    changes.extend(&self.deep_insert(right_entry.value));
                 }
             }
             // Leaf was replaced by subtree.
@@ -350,29 +431,24 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
                     nibbles: _lkey,
                     data: _ldata,
                 }),
-                _rnode,
+                rnode,
             ) => {
+                // TODO: Handle case
+                // Extension("aa", Leaf("bb")) -> Extension(aabb)
+                // Leaf(lnibble, ldata) -> Extension(nible, Branch(Some(rdata))) if lnibble == rnibble 
+
+                changes.register_data_change(Some(&left_entry.value), None);
                 changes.extend(&self.deep_remove(left_entry.value));
                 changes.extend(&self.deep_insert(right_entry.value));
             }
             // We found extension at left part that differ from node from right.
             // Go deeper to find any branch or leaf.
-            (
-                MerkleNode::Extension(Extension {
-                    nibbles: ext_key,
-                    value: mkl_value,
-                }),
-                _rnode,
-            ) => {
+            (MerkleNode::Extension(extension), _rnode) => {
                 changes.remove_node(&left_entry.value);
-                let full_key = {
-                    let mut lk = left_entry.nibble;
-                    lk.extend_from_slice(&ext_key);
-                    lk
-                };
                 changes.extend(
                     &self.compare_nodes(
-                        Entry::new(full_key, mkl_value)
+                        left_entry
+                            .push_extension(extension)
                             .try_map(|mkl_value| mkl_value.node(self.db.borrow()))
                             .expect(MERKLE_VALUE_EMPTY_EXT_ERR),
                         right_entry,
@@ -383,27 +459,31 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
             (
                 MerkleNode::Branch(Branch {
                     childs: left_values,
-                    data: left_data,
+                    data: _left_data,
                 }),
                 MerkleNode::Branch(Branch {
                     childs: right_values,
-                    data: right_data,
+                    data: _right_data,
                 }),
             ) if branch_level == ComparePathResult::SamePath => {
-                assert!(
-                    left_data.is_none(),
-                    "We support only fixed sized keys in diff"
-                );
-                assert!(
-                    right_data.is_none(),
-                    "We support only fixed sized keys in diff"
-                );
+                // assert!(
+                //     left_data.is_none(),
+                //     "We support only fixed sized keys in diff"
+                // );
+                // assert!(
+                //     right_data.is_none(),
+                //     "We support only fixed sized keys in diff"
+                // );
+
+                changes.register_data_change(Some(&left_entry.value), Some(&right_entry.value));
+
                 changes.remove_node(&left_entry.value);
                 changes.insert_node(&right_entry.value);
                 for (idx, (left_value, right_value)) in
                     left_values.iter().zip(right_values).enumerate()
                 {
                     let branch_key = {
+                        debug_assert_eq!(left_entry.nibble, right_entry.nibble);
                         let mut key = right_entry.nibble.clone(); // || left.key is equal to right.key
                         key.push(Nibble::from(idx));
                         key
@@ -454,6 +534,7 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
     where
         OpCollector<FN>: TrieInspector + Sync + Send,
     {
+        //TODO: Check that partial node can be handled correctly in diff
         let merkle_hashes = match node {
             KeyedMerkleNode::FullEncoded(hash, _) => vec![hash],
             KeyedMerkleNode::Partial(node) => {
@@ -502,7 +583,12 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
         self.deep_op(node, collector)
     }
 
-    fn check_branch_level(left_slice: NibbleSlice, right_slice: NibbleSlice) -> ComparePathResult {
+    fn compare_node_levels(
+        left_entry: &Entry<KeyedMerkleNode>,
+        right_entry: &Entry<KeyedMerkleNode>,
+    ) -> ComparePathResult {
+        let left_slice = &left_entry.nibble;
+        let right_slice = &right_entry.nibble;
         let common = nibble::common(left_slice, right_slice);
         match (
             common.len() != left_slice.len(),
@@ -516,6 +602,7 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
     }
 
     // Find branch for right_node and walk deeper into one of branch
+    // Also add remaining childs of left_node
     #[cfg_attr(feature = "tracing-enable", instrument(skip(self)))]
     fn walk_branch(
         &self,
@@ -544,9 +631,9 @@ impl<DB: Database + Send + Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + S
         );
         let right_nibble = right_postfix[0]; // find first different nibble
         let r_index: usize = right_nibble.into();
-        if let Some(conflict_branch) =
-            <MerkleValue as MerkleValueExt>::node(&left_entry.value[r_index], self.db.borrow())
-        {
+        let conflict_branch =
+            <MerkleValue as MerkleValueExt>::node(&left_entry.value[r_index], self.db.borrow());
+        if let Some(conflict_branch) = conflict_branch {
             let conflict_key = {
                 let mut lk = left_entry.nibble.clone();
                 lk.push(right_nibble);
