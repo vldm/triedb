@@ -273,6 +273,6 @@ mod tests {
             empty_trie_hash(),
             H256::from_slice(Keccak256::digest(NULL_RLP).as_slice())
         );
-        assert_eq!(NULL_RLP, rlp::encode(&""))
+        assert_eq!(NULL_RLP, rlp::encode(&String::from("")))
     }
 }
