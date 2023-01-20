@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
 };
 
-
 use primitive_types::H256;
 use sha3::{Digest, Keccak256};
 
@@ -131,7 +130,7 @@ impl Change {
 }
 
 /// Get the empty trie hash for merkle trie.
-pub fn empty_trie_hash() -> H256 {
+pub const fn empty_trie_hash() -> H256 {
     empty_trie_hash!()
 }
 
@@ -242,13 +241,16 @@ where
     diff_finder.get_changeset(from, to)
 }
 
+const KECCAK_NULL_RLP: H256 = H256([
+    0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+    0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+]);
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! empty_trie_hash {
     () => {{
-        use std::str::FromStr;
-
-        H256::from_str("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").unwrap()
+        crate::KECCAK_NULL_RLP
     }};
 }
 
@@ -256,14 +258,21 @@ macro_rules! empty_trie_hash {
 mod tests {
     use super::*;
 
-    const KECCAK_NULL_RLP: H256 = H256([
-        0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8,
-        0x6e, 0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63,
-        0xb4, 0x21,
-    ]);
+    use std::str::FromStr;
+
+    const NULL_RLP: &[u8] = &[0x80];
 
     #[test]
     fn it_checks_macro_generates_expected_empty_hash() {
-        assert_eq!(empty_trie_hash!(), KECCAK_NULL_RLP);
+        assert_eq!(
+            empty_trie_hash!(),
+            H256::from_str("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+                .unwrap()
+        );
+        assert_eq!(
+            empty_trie_hash(),
+            H256::from_slice(Keccak256::digest(NULL_RLP).as_slice())
+        );
+        assert_eq!(NULL_RLP, rlp::encode(&""))
     }
 }
