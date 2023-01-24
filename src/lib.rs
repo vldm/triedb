@@ -250,7 +250,7 @@ const KECCAK_NULL_RLP: H256 = H256([
 #[macro_export]
 macro_rules! empty_trie_hash {
     () => {{
-        crate::KECCAK_NULL_RLP
+        $crate::KECCAK_NULL_RLP
     }};
 }
 
