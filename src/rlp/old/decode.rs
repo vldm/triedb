@@ -17,16 +17,17 @@ pub trait Decodable<'a>: Sized {
     fn decode(bytes: &'a [u8]) -> Result<Self>;
 }
 
+#[allow(unused)] // really used in tests
 pub fn decode<'a, T: Decodable<'a> + 'a>(bytes: &'a [u8]) -> Result<T> {
     T::decode(bytes)
 }
 
-impl<T> Decodable<'a> for T
+impl<'a, T> Decodable<'a> for T
 where
     T: DecodableOwned,
 {
-    fn decode(rlp: &Rlp) -> Result<Self> {
-        <T as DecodableOwned>::decode(rlp)
+    fn decode(rlp: &'a [u8]) -> Result<Self> {
+        <T as DecodableOwned>::decode( &Rlp::new(rlp))
     }
 }
 
